@@ -4,6 +4,7 @@ Given a trained model and a feature vector, returns the per-feature SHAP
 values so the API/dashboard can show *why* a wallet received its score.
 """
 
+import numpy as np
 import shap
 
 
@@ -14,13 +15,19 @@ def explain_score(model, feature_vector: dict) -> dict:
     (Random Forest, XGBoost, or LightGBM all support `shap.TreeExplainer`).
     """
     feature_names = sorted(feature_vector.keys())
-    X = [[feature_vector[name] for name in feature_names]]
+    X = np.array([[feature_vector[name] for name in feature_names]])
 
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X)
 
-    # Binary classifiers may return a list of per-class arrays.
-    values = shap_values[1][0] if isinstance(shap_values, list) else shap_values[0]
+    if isinstance(shap_values, list):
+        # Older SHAP versions: list of per-class arrays, each (n_samples, n_features).
+        values = shap_values[1][0]
+    elif shap_values.ndim == 3:
+        # Newer SHAP versions: (n_samples, n_features, n_classes).
+        values = shap_values[0, :, 1]
+    else:
+        values = shap_values[0]
 
     return dict(zip(feature_names, (float(v) for v in values)))
 
