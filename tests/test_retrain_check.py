@@ -5,155 +5,97 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
-import pytest
 from typer.testing import CliRunner
 
+from cli import app
 from detection.drift_monitor import record_scored_features
 from detection.feature_engineering import FEATURE_NAMES
 
-
-@pytest.fixture
-def runner():
-    """Typer CLI test runner."""
-    return CliRunner()
-
-
-@pytest.fixture
-def mock_settings(tmp_path):
-    """Mock settings with temporary model directory."""
-    settings = MagicMock()
-    settings.model_dir = str(tmp_path / "models")
-    settings.db_path = str(tmp_path / "ledgerlens.db")
-    return settings
-
-
-@pytest.fixture
-def training_metadata(tmp_path):
-    """Create training metadata JSON for testing."""
-    metadata_dir = tmp_path / "models"
-    metadata_dir.mkdir(parents=True, exist_ok=True)
-
-    training_csv = metadata_dir / "training_reference.csv"
-    df = pd.DataFrame({
-        "feature_a": np.random.normal(0, 1, 100),
-        "feature_b": np.random.normal(0, 1, 100),
-        "feature_c": np.random.normal(0, 1, 100),
-    })
-    df.to_csv(training_csv, index=False)
-
-    metadata = {
-        "timestamp": "2024-01-01T00:00:00Z",
-        "version": "v0001",
-        "training_dataset_path": str(training_csv),
-        "training_row_count": 100,
-        "column_hash": "abc123",
-        "model_metrics": {
-            "random_forest": {"auc_roc": 0.85, "pr_auc": 0.80, "f1": 0.82},
-            "xgboost": {"auc_roc": 0.87, "pr_auc": 0.82, "f1": 0.84},
-            "lightgbm": {"auc_roc": 0.86, "pr_auc": 0.81, "f1": 0.83},
-        },
-    }
-
-    metadata_path = metadata_dir / "training_metadata.json"
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f)
-
-    return str(tmp_path)
+runner = CliRunner()
 
 
 class TestRetrainCheckCommand:
     """Tests for the retrain-check CLI command."""
 
-    @patch("detection.drift_monitor.run_drift_report")
-    @patch("detection.drift_monitor.is_drift_detected")
-    def test_retrain_check_skipped_when_no_drift(self, mock_is_drift, mock_drift_report, runner, mock_settings, tmp_path):
-        """retrain-check should skip retraining when drift is not detected."""
-        mock_drift_report.return_value = {"feature_a": 0.10, "feature_b": 0.15}
-        mock_is_drift.return_value = False
-
-        # Create training metadata
-        metadata_dir = tmp_path / "models"
+    def _write_training_metadata(self, metadata_dir, training_csv, model_metrics=None):
         metadata_dir.mkdir(parents=True, exist_ok=True)
-
-        training_csv = metadata_dir / "training_reference.csv"
-        df = pd.DataFrame({"feature_a": [1.0, 2.0], "feature_b": [3.0, 4.0]})
-        df.to_csv(training_csv, index=False)
-
         metadata_path = metadata_dir / "training_metadata.json"
         with open(metadata_path, "w") as f:
             json.dump({
                 "training_dataset_path": str(training_csv),
-                "model_metrics": {},
+                "model_metrics": model_metrics or {},
             }, f)
 
-        with patch("cli.settings", mock_settings):
-            mock_settings.model_dir = str(metadata_dir)
+    def _configure_model_dir(self, monkeypatch, metadata_dir):
+        monkeypatch.setenv("MODEL_DIR", str(metadata_dir))
+        import config.settings as settings_module
 
-            # We can't easily test the full CLI without more mocking,
-            # but we can verify the drift detection logic
-            report = mock_drift_report.return_value
-            is_drifted = mock_is_drift(report)
+        object.__setattr__(settings_module.settings, "model_dir", str(metadata_dir))
 
-            assert is_drifted is False
-
-    @patch("cli.train_ensemble")
-    @patch("detection.drift_monitor.run_drift_report")
-    @patch("detection.drift_monitor.is_drift_detected")
-    def test_retrain_check_triggered_on_drift(self, mock_is_drift, mock_drift_report, mock_train, runner, tmp_path):
-        """retrain-check should trigger retraining when drift is detected."""
-        mock_drift_report.return_value = {"feature_a": 0.25, "feature_b": 0.22, "feature_c": 0.21}
-        mock_is_drift.return_value = True
-
-        # Create a mock ensemble result
-        mock_model = MagicMock()
-        mock_train.return_value = {
-            "random_forest": {
-                "model": mock_model,
-                "auc_roc": 0.86,
-                "pr_auc": 0.81,
-                "f1": 0.83,
-            },
-            "xgboost": {
-                "model": mock_model,
-                "auc_roc": 0.88,
-                "pr_auc": 0.83,
-                "f1": 0.85,
-            },
-            "lightgbm": {
-                "model": mock_model,
-                "auc_roc": 0.87,
-                "pr_auc": 0.82,
-                "f1": 0.84,
-            },
-        }
-
-        # Create training metadata
+    def test_retrain_check_skipped_when_no_drift(self, monkeypatch, tmp_path):
+        """retrain-check should skip retraining when drift is not detected."""
         metadata_dir = tmp_path / "models"
-        metadata_dir.mkdir(parents=True, exist_ok=True)
-
         training_csv = metadata_dir / "training_reference.csv"
-        df = pd.DataFrame({
+        pd.DataFrame({"feature_a": [1.0, 2.0], "feature_b": [3.0, 4.0]}).to_csv(training_csv, index=False)
+        self._write_training_metadata(metadata_dir, training_csv)
+        self._configure_model_dir(monkeypatch, metadata_dir)
+
+        with (
+            patch("detection.drift_monitor.run_drift_report") as mock_drift_report,
+            patch("detection.drift_monitor.is_drift_detected") as mock_is_drift,
+            patch("detection.model_training.train_ensemble") as mock_train,
+        ):
+            mock_drift_report.return_value = {"feature_a": 0.10, "feature_b": 0.15}
+            mock_is_drift.return_value = False
+
+            result = runner.invoke(app, ["retrain-check"])
+
+            assert result.exit_code == 0, result.output
+            mock_is_drift.assert_called_once()
+            mock_train.assert_not_called()
+
+    def test_retrain_check_triggered_on_drift(self, monkeypatch, tmp_path):
+        """retrain-check should trigger retraining when drift is detected."""
+        metadata_dir = tmp_path / "models"
+        training_csv = metadata_dir / "training_reference.csv"
+        pd.DataFrame({
             "feature_a": np.random.normal(0, 1, 50),
             "feature_b": np.random.normal(0, 1, 50),
             "feature_c": np.random.normal(0, 1, 50),
-        })
-        df.to_csv(training_csv, index=False)
+        }).to_csv(training_csv, index=False)
+        self._write_training_metadata(
+            metadata_dir,
+            training_csv,
+            model_metrics={
+                "random_forest": {"auc_roc": 0.85},
+                "xgboost": {"auc_roc": 0.87},
+                "lightgbm": {"auc_roc": 0.86},
+            },
+        )
+        self._configure_model_dir(monkeypatch, metadata_dir)
 
-        metadata_path = metadata_dir / "training_metadata.json"
-        with open(metadata_path, "w") as f:
-            json.dump({
-                "training_dataset_path": str(training_csv),
-                "model_metrics": {
-                    "random_forest": {"auc_roc": 0.85},
-                    "xgboost": {"auc_roc": 0.87},
-                    "lightgbm": {"auc_roc": 0.86},
-                },
-            }, f)
+        mock_model = MagicMock()
+        mock_results = {
+            name: {"model": mock_model, "auc_roc": 0.90, "pr_auc": 0.85, "f1": 0.84}
+            for name in ("random_forest", "xgboost", "lightgbm")
+        }
 
-        # Verify drift detection logic
-        report = mock_drift_report.return_value
-        is_drifted = mock_is_drift(report)
-        assert is_drifted is True
+        with (
+            patch("detection.drift_monitor.run_drift_report") as mock_drift_report,
+            patch("detection.drift_monitor.is_drift_detected") as mock_is_drift,
+            patch("detection.model_training.train_ensemble", return_value=mock_results) as mock_train,
+            patch("detection.model_training.save_models") as mock_save_models,
+            patch("detection.model_registry.get_current_version", return_value="v0001"),
+        ):
+            mock_drift_report.return_value = {"feature_a": 0.25, "feature_b": 0.22, "feature_c": 0.21}
+            mock_is_drift.return_value = True
+
+            result = runner.invoke(app, ["retrain-check"])
+
+            assert result.exit_code == 0, result.output
+            mock_is_drift.assert_called_once()
+            mock_train.assert_called_once()
+            mock_save_models.assert_called_once()
 
     def test_drift_report_written(self, tmp_path):
         """Drift report should be written to drift_reports/ directory."""
@@ -232,18 +174,14 @@ class TestDriftDetectionIntegration:
         db_path = str(tmp_path / "test.db")
         training_csv = tmp_path / "training.csv"
 
-        # Create training reference
+        # Use one large reference pool; score a bootstrap sample from the same pool.
         np.random.seed(42)
-        training_data = np.random.normal(0, 1, 500)
+        training_data = np.random.normal(0, 1, 5000)
         training_df = pd.DataFrame({feature_name: training_data})
         training_df.to_csv(training_csv, index=False)
 
-        # Record similar features (same distribution)
-        np.random.seed(43)  # Different seed but same parameters
-        similar_features = [
-            {feature_name: v}
-            for v in np.random.normal(0, 1, 100)
-        ]
+        scored_values = np.random.choice(training_data, size=1000, replace=True)
+        similar_features = [{feature_name: float(v)} for v in scored_values]
         record_scored_features(similar_features, db_path=db_path)
 
         # Import here to avoid module-level database operations
@@ -251,7 +189,7 @@ class TestDriftDetectionIntegration:
 
         report = run_drift_report(str(training_csv), db_path=db_path)
 
-        # PSI should be low for consistent features
+        # PSI should be low when production samples come from the same distribution
         assert report.get(feature_name, 1.0) < 0.20
 
         # Drift should not be detected
