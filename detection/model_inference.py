@@ -19,6 +19,7 @@ import numpy as np
 
 import config.settings as settings_module
 from detection.feature_engineering import FEATURE_NAMES
+from detection.gnn_model import _HAS_PYG, safe_load_gnn_checkpoint
 from detection.model_signing import assert_within_model_dir, safe_joblib_load
 
 logger = logging.getLogger("ledgerlens.model_inference")
@@ -38,6 +39,7 @@ _MODEL_FILENAMES = {
     "xgboost": "xgboost.joblib",
     "lightgbm": "lightgbm.joblib",
     "temporal_lstm": "temporal_lstm.joblib",
+    "gnn": "gnn_model.pt",
 }
 
 _CALIBRATION_FILENAMES = {
@@ -126,10 +128,21 @@ def _load_models_base(model_dir: str | None = None) -> dict:
     signing_key = settings_module.settings.model_signing_key.encode()
     models = {}
     for name, filename in _MODEL_FILENAMES.items():
+        if name == "gnn":
+            continue
         path = os.path.join(model_dir, filename)
         if os.path.exists(path):
             assert_within_model_dir(path, model_dir)
             models[name] = safe_joblib_load(path, signing_key)
+
+    gnn_path = os.path.join(model_dir, _MODEL_FILENAMES["gnn"])
+    if os.path.exists(gnn_path) and _HAS_PYG:
+        try:
+            models["gnn"] = safe_load_gnn_checkpoint(gnn_path)
+        except RuntimeError as exc:
+            logger.error("GNN checkpoint failed validation: %s", exc)
+            raise
+
     if not models:
         raise FileNotFoundError(f"No trained models found in {model_dir}. Run model_training first.")
     return models
@@ -192,7 +205,7 @@ def score_feature_vector(models: dict, feature_vector: dict) -> tuple[float, flo
 
     probabilities = {}
     for name, model in models.items():
-        if name == "temporal_lstm":
+        if name in _NON_VOTING_MODELS:
             continue
         if hasattr(model, "feature_names_in_"):
             ordered = X[:, [FEATURE_NAMES.index(f) for f in model.feature_names_in_]]
@@ -233,7 +246,7 @@ def _score_feature_matrix_base(
 
     model_probs: dict[str, np.ndarray] = {}
     for name, model in models.items():
-        if name == "temporal_lstm":
+        if name in _NON_VOTING_MODELS:
             continue
         if hasattr(model, "feature_names_in_"):
             col_idx = [FEATURE_NAMES.index(f) for f in model.feature_names_in_]

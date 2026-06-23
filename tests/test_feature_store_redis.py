@@ -1,5 +1,7 @@
 """Tests for FeatureStore Redis integration and fallback behavior."""
 
+import importlib.util
+
 import pytest
 from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock
